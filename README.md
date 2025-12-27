@@ -6,7 +6,21 @@ The real challenge of such project is hitting near **zero-copy performance** by 
 
 On my **RTX 5060** I achieved **sub-ms speeds** in most kernels. This was done by minimizing global memory access with **shared memory** and optimizing kernel efficiency.
 
+What's more, application is encoding frames into HEVC video while displaying real-time result. Output file is ```camera.hevc```.
+
 ![Nsight Systems Kernel Time Report Screenshot](image.png)
+
+## Features
+
+- Real-time encoding with NVENC
+- Camera effects with sub-ms speeds
+- CUDA Streams and Events enhance parallel performance
+
+## Controls
+
+```1-4``` - Effects
+
+```space bar``` - Toggle encoding
 
 # Dependencies
 
