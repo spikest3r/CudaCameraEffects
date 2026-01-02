@@ -6,7 +6,17 @@ The real challenge of such project is hitting near **zero-copy performance** by 
 
 On my **RTX 5060** I achieved **sub-ms speeds** in most kernels. This was done by minimizing global memory access with **shared memory** and optimizing kernel efficiency.
 
-![Nsight Systems Kernel Time Report Screenshot](image.png)
+Kernels reach around 90-95% occupancy with 100% theoretical, meaning GPU cores are used near to full extent during frame processing.
+
+After some careful debugging and tracing, I furtherly improved kernel performance, although there is slowdown from 200 to 300 microseconds in ```mosaic``` kernel that has to be adressed.
+
+### Improved version reports
+
+![Nsight Systems Kernel Time Report Screenshot](image-1.png)
+
+### Nsight Compute ```spiral``` kernel report
+
+![alt text](image-2.png)
 
 # Dependencies
 

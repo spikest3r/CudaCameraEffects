@@ -1,8 +1,10 @@
-﻿#include <glad/glad.h>
+﻿#define NOMINMAX
+#include <glad/glad.h>
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include "device_launch_parameters.h"
 #include "cuda_runtime.h"
+#include <device_functions.h>
 #include <GLFW/glfw3.h>
 #include "cuda_gl_interop.h"
 #include "shader.h"
@@ -13,7 +15,7 @@
 
 #include "cuda.h"
 
-uint8_t effects;
+uint8_t effects = 0b11111111;
 bool encodeVideo = false;
 bool running = true;
 GLFWwindow* window;
@@ -32,30 +34,30 @@ simplelogger::Logger* logger = simplelogger::LoggerFactory::CreateConsoleLogger(
 
 __global__ void RGB2NV12(unsigned char* frame, uint8_t* pFrame, int width, int height)
 {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+     int x = blockIdx.x * blockDim.x + threadIdx.x;
+     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
-    const int idx = (x + y * width) * 3;
+     int idx = (x + y * width) * 3;
 
-    const unsigned char R = frame[idx + 2];
-    const unsigned char G = frame[idx + 1];
-    const unsigned char B = frame[idx + 0];
+     unsigned char R = frame[idx + 2];
+     unsigned char G = frame[idx + 1];
+     unsigned char B = frame[idx + 0];
 
-    const unsigned char Y = ((66 * R + 129 * G + 25 * B + 128) >> 8) + 16;
-    const unsigned char U = ((-38 * R - 74 * G + 112 * B + 128) >> 8) + 128;
-    const unsigned char V = ((112 * R - 94 * G - 18 * B + 128) >> 8) + 128;
+     unsigned char Y = ((66 * R + 129 * G + 25 * B + 128) >> 8) + 16;
+     unsigned char U = ((-38 * R - 74 * G + 112 * B + 128) >> 8) + 128;
+     unsigned char V = ((112 * R - 94 * G - 18 * B + 128) >> 8) + 128;
 
     // Y plane
-    const int yIndex = y * width + x;
+     int yIndex = y * width + x;
     pFrame[yIndex] = Y;
 
     // UV plane (1 sample per 2x2 pixels)
     if ((x % 2 == 0) && (y % 2 == 0)) {
-        const int uvWidth = width / 2;
-        const int uvX = x / 2;
-        const int uvY = y / 2;
-        const int uvIndex = width * height + (uvY * uvWidth + uvX) * 2;
+         int uvWidth = width / 2;
+         int uvX = x / 2;
+         int uvY = y / 2;
+         int uvIndex = width * height + (uvY * uvWidth + uvX) * 2;
         pFrame[uvIndex + 0] = U; // U
         pFrame[uvIndex + 1] = V; // V
     }
@@ -95,14 +97,21 @@ __device__ T clamp(T val, T minVal, T maxVal) {
     return max(min(val, maxVal), minVal);
 }
 
-__global__ void blitGl(unsigned char* frame, cudaSurfaceObject_t surface, int w, int h) {
+__global__ void __launch_bounds__(256, 6) blitGl(unsigned char* frame, cudaSurfaceObject_t surface, int w, int h) {
     int x = threadIdx.x + blockIdx.x * blockDim.x;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
+
     if (x >= w || y >= h) return;
 
-    int idx = (x + y * w) * 3;
+    unsigned char* p = frame + (x + y * w) * 3;
 
-    surf2Dwrite(make_uchar4(frame[idx + 2], frame[idx + 1], frame[idx + 0], 255), surface, x * sizeof(uchar4), h-y-1);
+    uchar4 out;
+    out.x = p[2]; // B
+    out.y = p[1]; // G
+    out.z = p[0]; // R
+    out.w = 255;  // A
+
+    surf2Dwrite(out, surface, x * 4, h - y - 1);
 }
 
 __global__ void mirrorX(unsigned char* in, unsigned char* out, int w, int h) {
@@ -122,33 +131,33 @@ __global__ void mirrorX(unsigned char* in, unsigned char* out, int w, int h) {
 __global__ void mosaic(unsigned char* in, unsigned char* out, int w, int h, int B) {
     __shared__ int sr, sg, sb, count;
 
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int x = blockIdx.x * B + tx;
-    const int y = blockIdx.y * B + ty;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int x = blockIdx.x * B + tx;
+    int y = blockIdx.y * B + ty;
 
     if (tx == 0 && ty == 0) {
         sr = sg = sb = 0;
-        const int bw = min(B, max(0, w - blockIdx.x * B));
-        const int bh = min(B, max(0, h - blockIdx.y * B));
+        int bw = min(B, max(0, w - blockIdx.x * B));
+        int bh = min(B, max(0, h - blockIdx.y * B));
         count = bw * bh;
     }
     __syncthreads();
 
     if (x < w && y < h) {
-        const int idx = (y * w + x) * 3;
+        int idx = (y * w + x) * 3;
         atomicAdd(&sr, in[idx + 0]);
         atomicAdd(&sg, in[idx + 1]);
         atomicAdd(&sb, in[idx + 2]);
     }
     __syncthreads();
     
-    const int r = sr / count;
-    const int g = sg / count;
-    const int b = sb / count;
+    int r = sr / count;
+    int g = sg / count;
+    int b = sb / count;
 
     if (x < w && y < h) {
-        const int outIdx = (y * w + x) * 3;
+        int outIdx = (y * w + x) * 3;
         out[outIdx + 0] = r;
         out[outIdx + 1] = g;
         out[outIdx + 2] = b;
@@ -168,39 +177,47 @@ __global__ void negative(unsigned char* in, unsigned char* out, int w, int h) {
     out[idx + 2] = 255 - in[idx + 2];
 }
 
-__global__ void spiral(unsigned char* in, unsigned char* out, int w, int h, float phase) {
+__constant__ constexpr float amplitude = 0.1f;   // radians, small twist per radius
+__constant__ constexpr float frequency = 0.1f;   // controls number of sine waves outwards
+
+__device__ __forceinline__ float fast_atan2(float y, float x) {
+    float abs_x = __int_as_float(__float_as_int(x) & 0x7fffffff);
+    float abs_y = __int_as_float(__float_as_int(y) & 0x7fffffff);
+
+    float a = (abs_x < abs_y) ? abs_x : abs_y;
+    float b = (abs_x > abs_y) ? abs_x : abs_y;
+
+    float s = (b > 0.0f) ? a/b : 0.0f;
+
+    float t = s * s;
+    float r = ((-0.0464964749f * t + 0.15931422f) * t - 0.327622764f) * t * s + s;
+
+    if (abs_y > abs_x) r = 1.57079633f - r;
+    if (x < 0.0f) r = 3.14159265f - r;
+    if (y < 0.0f) r = -r;
+
+    return r;
+}
+
+__global__ void __launch_bounds__(256, 6)
+spiral(unsigned char* in, unsigned char* out, int w, int h, float cx, float cy, float phase) {
     int x = threadIdx.x + blockIdx.x * blockDim.x;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     if (x >= w || y >= h) return;
 
-    const float cx = w / 2;
-    const float cy = h / 2;
+    float u = (float)x - cx;
+    float v = (float)y - cy;
 
-    constexpr float amplitude = 0.1f;   // radians, small twist per radius
-    constexpr float frequency = 0.1f;   // controls number of sine waves outwards
+    float r = __fsqrt_rn(u * u + v * v);
+    u = fast_atan2(v, u) + 0.1f * __sinf(0.1f * r + phase);
 
-    float u = x - cx;
-    float v = y - cy;
+    float nx = __fdividef(cx + r * __cosf(u), (float)(w - 1));
+    float ny = __fdividef(cy + r * __sinf(u), (float)(h - 1));
 
-    // polar coords
-    float r = sqrtf(u * u + v * v);
-    float theta = atan2(v, u);
+    int xi = __float2int_rn(__saturatef(nx) * (float)(w - 1));
+    int yi = __float2int_rn(__saturatef(ny) * (float)(h - 1));
 
-    // swirl / sine deformation
-    float theta2 = theta + amplitude * sinf(frequency * r + phase);
-
-    // back to Cartesian
-    float xf = cx + r * __cosf(theta2);
-    float yf = cy + r * __sinf(theta2);
-
-    // clamp & nearest neighbor sample
-    int xi = clamp(int(std::round(xf)), 0, w - 1);
-    int yi = clamp(int(std::round(yf)), 0, h - 1);
-
-    // copy pixel
-    for (int c = 0; c < 3; c++) {
-        out[(y * w + x) * 3 + c] = in[(yi * w + xi) * 3 + c];
-    }
+    reinterpret_cast<uchar3*>(out)[y * w + x] = reinterpret_cast<uchar3*>(in)[yi * w + xi];
 }
 
 void pollKeys() {
@@ -320,7 +337,7 @@ int main() {
 
     Shader shader(vertexCode, fragmentCode);
 
-    dim3 block(32, 32); // 32x32 threads per block
+    dim3 block(16, 16); // 32x32 threads per block
     dim3 grid(
         (1280 + block.x - 1) / block.x,  // ceil division
         (720 + block.y - 1) / block.y
@@ -372,7 +389,6 @@ int main() {
         // cuda
         cudaMemcpyAsync(pinned_frame, dataPtr, frameSize, cudaMemcpyHostToDevice, dataStream);
 
-
         cudaMemcpyAsync(d1, pinned_frame, frameSize, cudaMemcpyDeviceToDevice, dataStream);
 
         if (getBit(effects, 0)) {
@@ -393,7 +409,7 @@ int main() {
             std::swap(d1, d2);
         }
         if (getBit(effects, 3)) {
-            spiral << <grid, block >> > (d1, d2, 1280, 720, spiralT);
+            spiral << <grid, block >> > (d1, d2, 1280, 720, 1280/2, 720/2, spiralT);
             std::swap(d1, d2);
         }
 
