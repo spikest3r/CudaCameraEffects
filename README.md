@@ -6,6 +6,8 @@ The real challenge of such project is hitting near **zero-copy performance** by 
 
 On my **RTX 5060** I achieved **sub-ms speeds** in most kernels. This was done by minimizing global memory access with **shared memory** and optimizing kernel efficiency.
 
+What's more, application is encoding frames into HEVC video while displaying real-time result. Output file is ```camera.hevc```.
+
 Kernels reach around 90-95% occupancy with 100% theoretical, meaning GPU cores are used near to full extent during frame processing.
 
 After some careful debugging and tracing, I furtherly improved kernel performance, although there is slowdown from 200 to 300 microseconds in ```mosaic``` kernel that has to be adressed.
