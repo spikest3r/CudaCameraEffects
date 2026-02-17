@@ -1,5 +1,4 @@
-﻿#define NOMINMAX
-#include <glad/glad.h>
+﻿#include <glad/glad.h>
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include "device_launch_parameters.h"
@@ -8,6 +7,7 @@
 #include <GLFW/glfw3.h>
 #include "cuda_gl_interop.h"
 #include "shader.h"
+#include <atomic>
 
 #include "NvEncoder/NvEncoderCuda.h"
 #include "NvEncoder/NvEncoderOutputInVidMemCuda.h"
@@ -15,10 +15,32 @@
 
 #include "cuda.h"
 
+extern "C" {
+    #include <libavformat/avformat.h>
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/avutil.h>
+}
+
+struct EncodeBuffer {
+    unsigned char* frame;
+    bool available;
+};
+
+std::atomic<int> writeIndex{ 0 };
+std::atomic<int> readIndex{ 0 };
+EncodeBuffer buffers[4];
+
 uint8_t effects = 0b11111111;
 bool encodeVideo = false;
 bool running = true;
 GLFWwindow* window;
+
+int frame_index = 0;
+cudaStream_t nvencStream;
+AVStream* stream;
+AVFormatContext* fmt_ctx = nullptr;
+CUdeviceptr dFrame;
+CUcontext cuContext = nullptr;
 
 inline uint8_t getBit(uint8_t byte, uint8_t bit)
 {
@@ -238,8 +260,94 @@ void pollKeys() {
     }
 }
 
+std::unique_ptr<NvEncoderCuda> pEnc;
+
+void encodeThread() {
+    cudaSetDevice(0);
+
+    dim3 block(16, 16); // 32x32 threads per block
+    dim3 grid(
+        (1280 + block.x - 1) / block.x,  // ceil division
+              (720 + block.y - 1) / block.y
+    );
+
+    while (running) {
+        int idx = readIndex % 4;
+        if (!buffers[idx].available) {
+            RGB2NV12 << <grid, block, 0, nvencStream >> > (buffers[idx].frame, (uint8_t*)dFrame, 1280, 720);
+
+            const NvEncInputFrame* encoderInputFrame = pEnc->GetNextInputFrame();
+            NvEncoderCuda::CopyToDeviceFrame(
+                cuContext,
+                (uint8_t*)dFrame, 0, // device ptr
+                (CUdeviceptr)encoderInputFrame->inputPtr,
+                (int)encoderInputFrame->pitch,
+                1280,
+                720,
+                CU_MEMORYTYPE_DEVICE, // GPU→GPU
+                encoderInputFrame->bufferFormat,
+                encoderInputFrame->chromaOffsets,
+                encoderInputFrame->numChromaPlanes,
+                false,
+                nvencStream
+            );
+
+            std::vector<std::vector<uint8_t>> vPacket;
+            pEnc->EncodeFrame(vPacket);
+            for (auto& packet : vPacket) {
+                AVPacket pkt;
+                av_init_packet(&pkt);
+                pkt.data = packet.data();
+                pkt.size = packet.size();
+
+                pkt.pts = av_rescale_q(frame_index, {1, 30}, stream->time_base);
+                pkt.dts = pkt.pts;
+
+                pkt.stream_index = stream->index;
+                pkt.duration = av_rescale_q(1, {1, 30}, stream->time_base);
+
+                av_interleaved_write_frame(fmt_ctx, &pkt);
+                frame_index++;
+            }
+
+            // encode buffers[idx]
+            buffers[idx].available = true;
+            readIndex++;
+        }
+    }
+}
+
 int main() {
-    cv::VideoCapture cap(0); // 0 = default camera
+    cudaSetDevice(0);
+
+    avformat_network_init();
+
+    avformat_alloc_output_context2(&fmt_ctx, nullptr, "mp4", "camera.mp4");
+    if(!fmt_ctx) {
+        std::cerr << "Could not allocate format context\n";
+        return -1;
+    }
+
+    stream = avformat_new_stream(fmt_ctx, nullptr);
+    stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    stream->codecpar->codec_id = AV_CODEC_ID_H265;
+    stream->codecpar->width = 1280;
+    stream->codecpar->height = 720;
+    stream->time_base = {1, 30};
+
+    if (!(fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&fmt_ctx->pb, "camera.mp4", AVIO_FLAG_WRITE) < 0) {
+            std::cerr << "Could not open output file\n";
+            return -1;
+        }
+    }
+
+    avformat_write_header(fmt_ctx, nullptr);
+
+    cv::VideoCapture cap(0, cv::CAP_V4L2);
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
     if (!cap.isOpened()) {
         std::cerr << "Can't open camera!\n";
         return -1;
@@ -284,18 +392,14 @@ int main() {
 
     glBindVertexArray(0);
 
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-
     size_t frameSize = 1280 * 720 * 3 * sizeof(unsigned char);
 
     ck(cuInit(0));
     CUdevice cuDevice = 0;
     ck(cuDeviceGet(&cuDevice, 0));
-    CUcontext cuContext = nullptr;
     ck(cuCtxCreate(&cuContext, 0, 0, cuDevice));
 
-    std::unique_ptr<NvEncoderCuda> pEnc(new NvEncoderCuda(cuContext, 1280, 720, NV_ENC_BUFFER_FORMAT_NV12));
+    pEnc = std::unique_ptr<NvEncoderCuda>(new NvEncoderCuda(cuContext, 1280, 720, NV_ENC_BUFFER_FORMAT_NV12));
 
     NV_ENC_INITIALIZE_PARAMS initializeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
     NV_ENC_CONFIG encodeConfig = { NV_ENC_CONFIG_VER };
@@ -307,10 +411,7 @@ int main() {
     int nFrameSize = pEnc->GetFrameSize();
 
     // Allocate GPU frame buffer
-    CUdeviceptr dFrame;
     ck(cuMemAlloc(&dFrame, nFrameSize));
-
-    std::ofstream fpOut("camera.hevc", std::ios::out | std::ios::binary);
 
     unsigned char* pinned_frame;
     cudaHostAlloc(&pinned_frame, frameSize, cudaHostAllocDefault);
@@ -320,6 +421,10 @@ int main() {
 
     unsigned char* d2;
     cudaMalloc(&d2, frameSize);
+
+    for (int i = 0; i < 4; i++) {
+        cudaMalloc(&buffers[i].frame, frameSize);
+    }
 
     unsigned int texture;
     glGenTextures(1, &texture);
@@ -345,7 +450,6 @@ int main() {
 
     cudaStream_t dataStream;
     cudaStream_t processStream;
-    cudaStream_t nvencStream;
 
     cudaStreamCreate(&dataStream);
     cudaStreamCreate(&processStream);
@@ -373,6 +477,12 @@ int main() {
     float spiralT = 0.0f;
 
     float oldTime = 0.0f;
+
+    for(int i = 0; i < 4; i++) {
+        buffers[i].available = true;
+    }
+
+    std::thread encThread(encodeThread);
 
     while (!glfwWindowShouldClose(window)) {
         // deltatime
@@ -420,28 +530,14 @@ int main() {
 
         if (encodeVideo) {
             cudaStreamWaitEvent(nvencStream, eventA);
-            RGB2NV12 << <grid, block, 0, nvencStream >> > (d1, (uint8_t*)dFrame, 1280, 720);
 
-            const NvEncInputFrame* encoderInputFrame = pEnc->GetNextInputFrame();
-            NvEncoderCuda::CopyToDeviceFrame(
-                cuContext,
-                (uint8_t*)dFrame, 0, // device ptr
-                (CUdeviceptr)encoderInputFrame->inputPtr,
-                (int)encoderInputFrame->pitch,
-                1280,
-                720,
-                CU_MEMORYTYPE_DEVICE, // GPU→GPU
-                encoderInputFrame->bufferFormat,
-                encoderInputFrame->chromaOffsets,
-                encoderInputFrame->numChromaPlanes,
-                false,
-                nvencStream
-            );
-
-            std::vector<std::vector<uint8_t>> vPacket;
-            pEnc->EncodeFrame(vPacket);
-            for (auto& packet : vPacket)
-                fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
+            int idx = writeIndex % 4;
+            if (buffers[idx].available) {
+                cudaMemcpyAsync(buffers[idx].frame, d1, frameSize, cudaMemcpyDeviceToDevice, nvencStream);
+                cudaEventRecord(eventA, nvencStream);
+                buffers[idx].available = false;
+                writeIndex++;
+            }
         }
 
         cudaGraphicsUnmapResources(1, &cudaResource, dataStream);
@@ -457,18 +553,32 @@ int main() {
         glfwSwapBuffers(window);
     }
 
-    std::vector<std::vector<uint8_t>> vPacket;
-    pEnc->EndEncode(vPacket);
-    for (auto& packet : vPacket)
-        fpOut.write(reinterpret_cast<char*>(packet.data()), packet.size());
+    // std::vector<std::vector<uint8_t>> vPacket;
+    // pEnc->EndEncode(vPacket);
+    // for (auto& packet : vPacket) {
+    //     AVPacket pkt;
+    //     av_init_packet(&pkt);
+    //     pkt.data = packet.data();
+    //     pkt.size = packet.size();
+    //     pkt.pts  = frame_index;
+    //     pkt.dts  = frame_index;
+    //     pkt.stream_index = stream->index;
+    //
+    //     av_interleaved_write_frame(fmt_ctx, &pkt);
+    //     frame_index++;
+    // }
+
+    av_write_trailer(fmt_ctx);
+    avio_closep(&fmt_ctx->pb);
+    avformat_free_context(fmt_ctx);
 
     pEnc->DestroyEncoder();
-    fpOut.close();
     ck(cuMemFree(dFrame));
     ck(cuCtxDestroy(cuContext));
 
     running = false;
-    thread.join();
+    if(encThread.joinable()) encThread.join();
+    if(thread.joinable()) thread.join();
 
     cudaDestroySurfaceObject(surface);
     cudaFreeHost(pinned_frame);

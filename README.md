@@ -12,6 +12,8 @@ Kernels reach around 90-95% occupancy with 100% theoretical, meaning GPU cores a
 
 After some careful debugging and tracing, I furtherly improved kernel performance, although there is slowdown from 200 to 300 microseconds in ```mosaic``` kernel that has to be adressed.
 
+FFMPEG API makes sure that app produces playable HEVC MP4.
+
 ### Improved version reports
 
 ![Nsight Systems Kernel Time Report Screenshot](image-1.png)
@@ -27,3 +29,4 @@ After some careful debugging and tracing, I furtherly improved kernel performanc
 * GLAD
 * Video Codec SDK
 * OpenCV
+* FFMPEG

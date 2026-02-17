@@ -1,8 +1,8 @@
 #include "shader.h"
 #include <glad/glad.h>
-#include <Windows.h>
 #include <string>
 #include <glm/glm.hpp>
+#include <iostream>
 
 using namespace std;
 
@@ -29,7 +29,7 @@ Shader::Shader(const char* vertexSource, const char* fragmentSource) {
     glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
     if (!success) {
         glGetShaderInfoLog(vertexShader, 1024, NULL, infoLog);
-        MessageBoxA(NULL, infoLog, "Vertex Shader Compilation Error", MB_OK | MB_ICONERROR);
+        std::cerr <<infoLog << '\n';
     }
 
     // Compile fragment shader
@@ -37,7 +37,7 @@ Shader::Shader(const char* vertexSource, const char* fragmentSource) {
     glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
     if (!success) {
         glGetShaderInfoLog(fragmentShader, 1024, NULL, infoLog);
-        MessageBoxA(NULL, infoLog, "Fragment Shader Compilation Error", MB_OK | MB_ICONERROR);
+        std::cerr <<infoLog << '\n';
     }
 
     // Create program and link
@@ -50,7 +50,7 @@ Shader::Shader(const char* vertexSource, const char* fragmentSource) {
     glGetProgramiv(ID, GL_LINK_STATUS, &success);
     if (!success) {
         glGetProgramInfoLog(ID, 1024, NULL, infoLog);
-        MessageBoxA(NULL, infoLog, "Shader Program Linking Error", MB_OK | MB_ICONERROR);
+        std::cerr <<infoLog << '\n';
     }
 
     // Delete shaders after linking
